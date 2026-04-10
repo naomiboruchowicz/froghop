@@ -2,9 +2,9 @@ const CANVAS_W = 700;
 const CANVAS_H = 300;
 const GROUND_Y = CANVAS_H - CANVAS_H / 5;
 
-const BASE_SPEED = 6;
+const BASE_SPEED = 4;
 const GRAVITY = 0.8;
-const JUMP_IMPULSE = -12;
+const JUMP_IMPULSE = -10;
 
 const FROG_W = 90;
 const FROG_H = 70;
@@ -12,8 +12,8 @@ const FROG_DUCK_H = 50;
 const FROG_JUMP_H = 30;
 
 const SNAKE_SCORE_THRESHOLD = 150;
-const SNAKE_SPAWN_DELAY_MIN = 1400;
-const SNAKE_SPAWN_DELAY_MAX = 2200;
+const SNAKE_SPAWN_DELAY_MIN = 2200;
+const SNAKE_SPAWN_DELAY_MAX = 3500;
 const SNAKE_W = 140;
 const SNAKE_H = 200;
 const SNAKE_CLEARANCE = 6;
@@ -59,35 +59,41 @@ let pixelFont = null;
 let video = null;
 let bodyPose = null;
 let poses = [];
-let calibratedY = null;
-let calibrationSamples = [];
-const CALIBRATION_DURATION = 90;
-const DUCK_THRESHOLD = 28;
 const CAM_W = 140;
 const CAM_H = 105;
 const CAM_MARGIN = 8;
-const VIDEO_W = 640;
-const VIDEO_H = 480;
+const VIDEO_W = 320;
+const VIDEO_H = 240;
 
-let smoothNoseY = null;
-let prevSmooth = null;
-const SMOOTH_FACTOR = 0.6; // fast response
+let poseHistory = []; // [{t: millis, y: noseY}, ...]
+const WINDOW_MS = 120; // tight window: responsive but enough samples to filter jitter
 
-// Jump: velocity-based detection (how fast nose moves up, not just position)
-let lastJumpTime = 0;
-const JUMP_COOLDOWN = 800;
-const JUMP_VELOCITY = -4; // nose must move up this many px/frame to count as jump (negative = up)
+// Calibration removed - speed-based detection doesn't need a baseline
 
-// Duck debounce: sustained crouch required
-let duckStartTime = 0;
-let isDucking = false;
-const DUCK_DELAY = 250;
+// Speed thresholds (px per 100ms). Only fast, intentional movements trigger.
+// Slow leans/nods won't hit these. Negative = upward, positive = downward.
+const JUMP_THRESHOLD = -9;
+const DUCK_THRESHOLD = 12;
+let cooldown = false;
+const JUMP_COOLDOWN_MS = 1000;
+const DUCK_DURATION_MS = 700;
+let bodyState = "neutral";
 
 // --- Game state machine ---
-// "start" -> "positioning" -> "calibrating" -> "playing"
 let gameState = "start";
 let startButtonHover = false;
 let readyButtonHover = false;
+
+// --- CSS scaling helpers ---
+let canvasEl = null;
+function gameMouseX() {
+  if (!canvasEl) return mouseX;
+  return mouseX * (CANVAS_W / canvasEl.clientWidth);
+}
+function gameMouseY() {
+  if (!canvasEl) return mouseY;
+  return mouseY * (CANVAS_H / canvasEl.clientHeight);
+}
 
 function preload() {
   jungleImg = loadImage("assets/jungle.png");
@@ -105,18 +111,15 @@ function setup() {
   const canvas = createCanvas(CANVAS_W, CANVAS_H);
   const container = document.getElementById("game-container");
   if (container) canvas.parent("#game-container");
+  canvasEl = document.querySelector("#game-container canvas");
   if (pixelFont) textFont(pixelFont);
   resetGame();
 }
 
 function startCamera() {
   video = createCapture(VIDEO, function () {
-    console.log("Camera ready, initializing bodyPose...");
-    // Init model AFTER camera is ready, with callback when model is loaded
     bodyPose = ml5.bodyPose("MoveNet", { flipped: true }, function () {
-      console.log("bodyPose model loaded, starting detection...");
       bodyPose.detectStart(video, gotPoses);
-      console.log("detectStart called");
     });
     gameState = "positioning";
   });
@@ -128,11 +131,13 @@ function gotPoses(results) {
   poses = results;
 }
 
+// --- Keypoint helpers ---
+
 function getNoseY() {
   if (poses.length === 0) return null;
   const kp = poses[0].keypoints;
   if (!kp || kp.length === 0) return null;
-  const nose = kp[0]; // index 0 is nose in MoveNet
+  const nose = kp[0];
   if (!nose || nose.confidence < 0.15) return null;
   return nose.y;
 }
@@ -146,60 +151,83 @@ function getNoseXY() {
   return { x: nose.x, y: nose.y };
 }
 
-function updatePoseControls() {
-  const rawNoseY = getNoseY();
-  if (rawNoseY === null) return;
+function hasBody() {
+  return getNoseY() !== null;
+}
 
-  if (smoothNoseY === null) {
-    smoothNoseY = rawNoseY;
-    prevSmooth = rawNoseY;
-  } else {
-    prevSmooth = smoothNoseY;
-    smoothNoseY = smoothNoseY + SMOOTH_FACTOR * (rawNoseY - smoothNoseY);
-  }
+// --- Sliding window velocity ---
 
-  if (gameState === "calibrating") {
-    calibrationSamples.push(smoothNoseY);
-    if (calibrationSamples.length >= CALIBRATION_DURATION) {
-      const sorted = [...calibrationSamples].sort((a, b) => a - b);
-      calibratedY = sorted[Math.floor(sorted.length / 2)];
-      gameState = "playing";
+// Returns how fast nose moved in the last WINDOW_MS (px per 100ms)
+// Negative = fast upward, positive = fast downward, near zero = slow/still
+const MIN_DISPLACEMENT = 8; // nose must move at least this many px to count (kills jitter)
+
+function getSpeed() {
+  if (poseHistory.length < 3) return 0;
+  const now = millis();
+  const cutoff = now - WINDOW_MS;
+
+  // Find oldest sample within window
+  let oldest = null;
+  for (let i = 0; i < poseHistory.length; i++) {
+    if (poseHistory[i].t >= cutoff) {
+      oldest = poseHistory[i];
+      break;
     }
-    return;
   }
+  if (!oldest) return 0;
 
-  if (gameState !== "playing" || calibratedY === null) return;
+  const newest = poseHistory[poseHistory.length - 1];
+  const dt = newest.t - oldest.t;
+  if (dt < 20) return 0;
 
-  const delta = smoothNoseY - calibratedY;
-  const velocity = smoothNoseY - prevSmooth; // negative = moving up
+  const displacement = newest.y - oldest.y;
+
+  // If nose didn't actually move enough pixels, it's jitter, not real movement
+  if (Math.abs(displacement) < MIN_DISPLACEMENT) return 0;
+
+  return (displacement / dt) * 100;
+}
+
+// --- Main detection logic ---
+
+function updatePoseControls() {
+  const ny = getNoseY();
+  if (ny === null) return;
+
   const now = millis();
 
-  // Velocity-based jump: detect fast upward motion
-  // This catches jumps regardless of how far you move, just how fast
-  if (velocity < JUMP_VELOCITY && frog.y === GROUND_Y && now - lastJumpTime > JUMP_COOLDOWN) {
-    frog.vy = JUMP_IMPULSE;
-    lastJumpTime = now;
-    // Cancel any duck-in-progress (the crouch was a jump windup, not a duck)
-    duckStartTime = 0;
-    isDucking = false;
+  // Add to sliding window and prune old entries
+  poseHistory.push({ t: now, y: ny });
+  while (poseHistory.length > 0 && poseHistory[0].t < now - WINDOW_MS * 3) {
+    poseHistory.shift();
   }
 
-  // Duck: require sustained crouch before triggering
-  const wantsDuck = delta > DUCK_THRESHOLD && frog.y === GROUND_Y;
+  if (gameState !== "playing") return;
 
-  if (wantsDuck) {
-    if (duckStartTime === 0) {
-      duckStartTime = now;
+  const spd = getSpeed(); // negative = fast upward, positive = fast downward
+
+  if (!cooldown) {
+    if (spd < JUMP_THRESHOLD && frog.y === GROUND_Y) {
+      // JUMP: strong upward trend
+      frog.vy = JUMP_IMPULSE;
+      bodyState = "jumping";
+      cooldown = true;
+      setTimeout(function () {
+        cooldown = false;
+        bodyState = "neutral";
+      }, JUMP_COOLDOWN_MS);
+    } else if (spd > DUCK_THRESHOLD && frog.y === GROUND_Y) {
+      // DUCK: strong downward trend, hold for fixed duration then release
+      bodyState = "ducking";
+      cooldown = true;
+      setTimeout(function () {
+        bodyState = "neutral";
+        cooldown = false;
+      }, DUCK_DURATION_MS);
     }
-    if (now - duckStartTime >= DUCK_DELAY) {
-      isDucking = true;
-    }
-  } else {
-    duckStartTime = 0;
-    isDucking = false;
   }
 
-  frog.ducking = isDucking;
+  frog.ducking = bodyState === "ducking" && frog.y === GROUND_Y;
 }
 
 function resetGame() {
@@ -215,12 +243,14 @@ function resetGame() {
   speed = BASE_SPEED;
   gameOver = false;
   gamePaused = false;
-  spawnTimer = 900;
+  spawnTimer = 2500;
   bgOffset = 0;
   groundOffset = 0;
 }
 
-// --- Drawing ---
+// =====================
+//     DRAWING
+// =====================
 
 function draw() {
   background(12, 20, 18);
@@ -235,7 +265,6 @@ function draw() {
     return;
   }
 
-  // calibrating or playing
   drawBackground();
   drawGround();
 
@@ -255,16 +284,14 @@ function draw() {
   drawHud();
   drawCamPip();
 
-  if (gameState === "calibrating") {
-    drawCalibrationOverlay();
-  } else if (gameOver) {
+  if (gameOver) {
     drawGameOver();
   } else if (gamePaused) {
     drawPaused();
   }
 }
 
-// --- Screen: Start ---
+// --- Start screen ---
 function drawStartScreen() {
   drawBackground();
   drawGround();
@@ -289,7 +316,9 @@ function drawStartScreen() {
   const btnH = 40;
   const btnX = CANVAS_W / 2 - btnW / 2;
   const btnY = 185;
-  startButtonHover = mouseX > btnX && mouseX < btnX + btnW && mouseY > btnY && mouseY < btnY + btnH;
+  const mx = gameMouseX();
+  const my = gameMouseY();
+  startButtonHover = mx > btnX && mx < btnX + btnW && my > btnY && my < btnY + btnH;
 
   fill(startButtonHover ? color(120, 240, 160) : color(100, 220, 140));
   noStroke();
@@ -306,7 +335,7 @@ function drawStartScreen() {
   text("Keyboard also works (Space / Arrow keys)", CANVAS_W / 2, 262);
 }
 
-// --- Screen: Positioning ---
+// --- Positioning screen ---
 function drawPositioningScreen() {
   fill(12, 20, 18);
   noStroke();
@@ -317,14 +346,12 @@ function drawPositioningScreen() {
   const prevX = CANVAS_W / 2 - prevW / 2;
   const prevY = 20;
 
-  // Border
   stroke(232, 245, 244, 60);
   strokeWeight(2);
   noFill();
   rect(prevX - 1, prevY - 1, prevW + 2, prevH + 2, 6);
   noStroke();
 
-  // Draw mirrored camera feed
   if (video) {
     push();
     translate(prevX + prevW, prevY);
@@ -334,10 +361,9 @@ function drawPositioningScreen() {
   }
 
   const nose = getNoseXY();
-  const noseDetected = nose !== null;
+  const detected = nose !== null;
 
-  // Draw nose indicator (coordinates are already flipped by ml5)
-  if (noseDetected) {
+  if (detected) {
     const dotX = prevX + (nose.x / VIDEO_W) * prevW;
     const dotY = prevY + (nose.y / VIDEO_H) * prevH;
 
@@ -351,7 +377,6 @@ function drawPositioningScreen() {
     ellipse(dotX, dotY, 8, 8);
   }
 
-  // LIVE dot
   fill(255, 60, 60);
   noStroke();
   ellipse(prevX + 12, prevY + 12, 7, 7);
@@ -360,11 +385,10 @@ function drawPositioningScreen() {
   textAlign(LEFT, CENTER);
   text("LIVE", prevX + 19, prevY + 12);
 
-  // Status
   textAlign(CENTER, CENTER);
   const statusY = prevY + prevH + 18;
 
-  if (!noseDetected) {
+  if (!detected) {
     fill(255, 200, 80);
     textSize(9);
     text("Move so the camera can see your face", CANVAS_W / 2, statusY);
@@ -382,7 +406,9 @@ function drawPositioningScreen() {
     const btnH = 32;
     const btnX = CANVAS_W / 2 - btnW / 2;
     const btnY = statusY + 14;
-    readyButtonHover = mouseX > btnX && mouseX < btnX + btnW && mouseY > btnY && mouseY < btnY + btnH;
+    const mx = gameMouseX();
+    const my = gameMouseY();
+    readyButtonHover = mx > btnX && mx < btnX + btnW && my > btnY && my < btnY + btnH;
 
     fill(readyButtonHover ? color(120, 240, 160) : color(100, 220, 140));
     noStroke();
@@ -392,37 +418,6 @@ function drawPositioningScreen() {
     textSize(10);
     text("READY", btnX + btnW / 2, btnY + btnH / 2);
   }
-}
-
-// --- Calibration overlay ---
-function drawCalibrationOverlay() {
-  fill(0, 0, 0, 160);
-  noStroke();
-  rect(0, 0, CANVAS_W, CANVAS_H);
-
-  const progress = calibrationSamples.length / CALIBRATION_DURATION;
-
-  fill(232, 245, 244);
-  stroke(12, 20, 18);
-  strokeWeight(3);
-  textAlign(CENTER, CENTER);
-  textSize(16);
-  text("HOLD STILL", CANVAS_W / 2, CANVAS_H / 2 - 24);
-
-  textSize(9);
-  noStroke();
-  fill(232, 245, 244, 160);
-  text("Stand in your normal position", CANVAS_W / 2, CANVAS_H / 2);
-
-  const barW = 160;
-  const barH = 8;
-  const barX = CANVAS_W / 2 - barW / 2;
-  const barY = CANVAS_H / 2 + 18;
-  fill(40, 60, 55);
-  noStroke();
-  rect(barX, barY, barW, barH, 4);
-  fill(100, 220, 140);
-  rect(barX, barY, barW * progress, barH, 4);
 }
 
 // --- Camera PIP during gameplay ---
@@ -438,14 +433,12 @@ function drawCamPip() {
   rect(x - 1, y - 1, CAM_W + 2, CAM_H + 2, 3);
   noStroke();
 
-  // Draw mirrored camera feed
   push();
   translate(x + CAM_W, y);
   scale(-1, 1);
   image(video, 0, 0, CAM_W, CAM_H);
   pop();
 
-  // Nose dot (coordinates already flipped by ml5)
   const nose = getNoseXY();
   if (nose) {
     const dotX = x + (nose.x / VIDEO_W) * CAM_W;
@@ -453,40 +446,29 @@ function drawCamPip() {
     fill(100, 220, 140);
     noStroke();
     ellipse(dotX, dotY, 5, 5);
-
-    if (calibratedY !== null) {
-      const baselineY = y + (calibratedY / VIDEO_H) * CAM_H;
-      stroke(100, 220, 140, 80);
-      strokeWeight(1);
-      line(x, baselineY, x + CAM_W, baselineY);
-
-      stroke(255, 200, 80, 40);
-      const jumpLineY = y + ((calibratedY - JUMP_THRESHOLD) / VIDEO_H) * CAM_H;
-      line(x, jumpLineY, x + CAM_W, jumpLineY);
-
-      stroke(80, 160, 255, 40);
-      const duckLineY = y + ((calibratedY + DUCK_THRESHOLD) / VIDEO_H) * CAM_H;
-      line(x, duckLineY, x + CAM_W, duckLineY);
-      noStroke();
-    }
   }
 
-  // LIVE indicator
-  fill(255, 60, 60);
+  // State indicator
+  let stateColor;
+  if (bodyState === "jumping") stateColor = color(255, 200, 80);
+  else if (bodyState === "ducking") stateColor = color(80, 160, 255);
+  else stateColor = color(100, 220, 140);
+
+  fill(stateColor);
   noStroke();
-  ellipse(x + 8, y + 8, 5, 5);
+  ellipse(x + 8, y + 8, 6, 6);
   fill(232, 245, 244, 150);
   textSize(6);
   textAlign(LEFT, CENTER);
-  text("LIVE", x + 13, y + 8);
+  text(bodyState.toUpperCase(), x + 14, y + 8);
 }
 
-// --- Original game drawing ---
+// --- Game drawing ---
 
 function drawBackground() {
   if (!jungleImg) return;
-  const scale = CANVAS_H / jungleImg.height;
-  const scaledW = jungleImg.width * scale;
+  const sc = CANVAS_H / jungleImg.height;
+  const scaledW = jungleImg.width * sc;
   const x = -(bgOffset % scaledW);
   image(jungleImg, x, 0, scaledW, CANVAS_H);
   image(jungleImg, x + scaledW, 0, scaledW, CANVAS_H);
@@ -526,7 +508,7 @@ function updateFrog() {
 }
 
 function drawFrog() {
-  if (gameState !== "playing" && gameState !== "calibrating") return;
+  if (gameState !== "playing") return;
 
   const isJumping = frog.y < GROUND_Y - 0.5;
   const runOffset = (floor(frameCount / 8) % 2) * 2;
@@ -584,7 +566,7 @@ function spawnObstacle() {
 }
 
 function drawObstacles() {
-  if (gameState !== "playing" && gameState !== "calibrating") return;
+  if (gameState !== "playing") return;
   obstacles.forEach((obstacle) => {
     const img = obstacle.type === "rock" ? rockImg : logImg;
     if (img) {
@@ -614,7 +596,7 @@ function spawnSnake() {
 }
 
 function drawSnakes() {
-  if (gameState !== "playing" && gameState !== "calibrating") return;
+  if (gameState !== "playing") return;
   if (!snakeImg) return;
   snakes.forEach((snake) => {
     image(snakeImg, snake.x, snake.y, snake.w, snake.h);
@@ -724,11 +706,9 @@ function mousePressed() {
     startCamera();
     return false;
   }
-  if (gameState === "positioning" && readyButtonHover && getNoseY() !== null) {
-    gameState = "calibrating";
-    calibrationSamples = [];
-    calibratedY = null;
-    smoothNoseY = null;
+  if (gameState === "positioning" && readyButtonHover && hasBody()) {
+    gameState = "playing";
+    poseHistory = [];
     return false;
   }
   return true;
@@ -740,13 +720,6 @@ function keyPressed() {
   if (key === "p" || key === "P") {
     if (gameState !== "playing" || gameOver) return true;
     gamePaused = !gamePaused;
-    return false;
-  }
-  if ((key === "r" || key === "R") && gameState === "playing") {
-    gameState = "calibrating";
-    calibrationSamples = [];
-    calibratedY = null;
-    smoothNoseY = null;
     return false;
   }
   if (gameOver && isJumpKey) {
