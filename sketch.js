@@ -3,8 +3,8 @@ const CANVAS_H = 300;
 const GROUND_Y = CANVAS_H - CANVAS_H / 5;
 
 const BASE_SPEED = 4;
-const GRAVITY = 0.8;
-const JUMP_IMPULSE = -10;
+const GRAVITY = 0.55;
+const JUMP_IMPULSE = -12;
 
 const FROG_W = 90;
 const FROG_H = 70;
@@ -72,12 +72,16 @@ const WINDOW_MS = 120; // tight window: responsive but enough samples to filter 
 
 // Speed thresholds (px per 100ms). Only fast, intentional movements trigger.
 // Slow leans/nods won't hit these. Negative = upward, positive = downward.
-const JUMP_THRESHOLD = -9;
+const JUMP_THRESHOLD = -7;
 const DUCK_THRESHOLD = 12;
 let cooldown = false;
 const JUMP_COOLDOWN_MS = 1000;
 const DUCK_DURATION_MS = 700;
+const DUCK_RECOVERY_MS = 500;
+const DUCK_CONFIRM_MS = 100; // wait this long before committing to duck (pre-jump crouch cancels it)
 let bodyState = "neutral";
+let duckPending = false;
+let duckPendingTimer = null;
 
 // --- Game state machine ---
 let gameState = "start";
@@ -159,14 +163,14 @@ function hasBody() {
 
 // Returns how fast nose moved in the last WINDOW_MS (px per 100ms)
 // Negative = fast upward, positive = fast downward, near zero = slow/still
-const MIN_DISPLACEMENT = 8; // nose must move at least this many px to count (kills jitter)
+const MIN_DISPLACEMENT = 8;       // general jitter floor
+const JUMP_MIN_DISPLACEMENT = 15;  // jump needs more travel than a nod (~15px at 240p)
 
-function getSpeed() {
-  if (poseHistory.length < 3) return 0;
+function getMotion() {
+  if (poseHistory.length < 3) return { speed: 0, displacement: 0 };
   const now = millis();
   const cutoff = now - WINDOW_MS;
 
-  // Find oldest sample within window
   let oldest = null;
   for (let i = 0; i < poseHistory.length; i++) {
     if (poseHistory[i].t >= cutoff) {
@@ -174,18 +178,17 @@ function getSpeed() {
       break;
     }
   }
-  if (!oldest) return 0;
+  if (!oldest) return { speed: 0, displacement: 0 };
 
   const newest = poseHistory[poseHistory.length - 1];
   const dt = newest.t - oldest.t;
-  if (dt < 20) return 0;
+  if (dt < 20) return { speed: 0, displacement: 0 };
 
   const displacement = newest.y - oldest.y;
 
-  // If nose didn't actually move enough pixels, it's jitter, not real movement
-  if (Math.abs(displacement) < MIN_DISPLACEMENT) return 0;
+  if (Math.abs(displacement) < MIN_DISPLACEMENT) return { speed: 0, displacement: 0 };
 
-  return (displacement / dt) * 100;
+  return { speed: (displacement / dt) * 100, displacement: displacement };
 }
 
 // --- Main detection logic ---
@@ -204,11 +207,17 @@ function updatePoseControls() {
 
   if (gameState !== "playing") return;
 
-  const spd = getSpeed(); // negative = fast upward, positive = fast downward
+  const { speed: spd, displacement } = getMotion();
 
   if (!cooldown) {
-    if (spd < JUMP_THRESHOLD && frog.y === GROUND_Y) {
-      // JUMP: strong upward trend
+    // Jump needs fast upward speed AND enough distance (filters out nods)
+    if (spd < JUMP_THRESHOLD && displacement < -JUMP_MIN_DISPLACEMENT && frog.y === GROUND_Y) {
+      // Cancel any pending duck (it was a pre-jump crouch, not a real duck)
+      if (duckPendingTimer) {
+        clearTimeout(duckPendingTimer);
+        duckPendingTimer = null;
+        duckPending = false;
+      }
       frog.vy = JUMP_IMPULSE;
       bodyState = "jumping";
       cooldown = true;
@@ -216,14 +225,24 @@ function updatePoseControls() {
         cooldown = false;
         bodyState = "neutral";
       }, JUMP_COOLDOWN_MS);
-    } else if (spd > DUCK_THRESHOLD && frog.y === GROUND_Y) {
-      // DUCK: strong downward trend, hold for fixed duration then release
-      bodyState = "ducking";
-      cooldown = true;
-      setTimeout(function () {
-        bodyState = "neutral";
-        cooldown = false;
-      }, DUCK_DURATION_MS);
+    } else if (spd > DUCK_THRESHOLD && frog.y === GROUND_Y && !duckPending) {
+      // Don't duck immediately. Wait DUCK_CONFIRM_MS to see if it's a pre-jump crouch.
+      duckPending = true;
+      duckPendingTimer = setTimeout(function () {
+        duckPending = false;
+        duckPendingTimer = null;
+        // If still not in cooldown (no jump happened), commit to duck
+        if (!cooldown) {
+          bodyState = "ducking";
+          cooldown = true;
+          setTimeout(function () {
+            bodyState = "neutral";
+            setTimeout(function () {
+              cooldown = false;
+            }, DUCK_RECOVERY_MS);
+          }, DUCK_DURATION_MS);
+        }
+      }, DUCK_CONFIRM_MS);
     }
   }
 
