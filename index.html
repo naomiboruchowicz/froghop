@@ -12,21 +12,10 @@
       image-rendering: pixelated;
       image-rendering: crisp-edges;
       aspect-ratio: 700 / 300 !important;
-    }
-    /* Portrait or narrow: fit width */
-    @media (max-aspect-ratio: 7/3) {
-      #game-container canvas {
-        width: 100vw !important;
-        height: auto !important;
-      }
-    }
-    /* Landscape or wide: fit height */
-    @media (min-aspect-ratio: 7/3) {
-      #game-container canvas {
-        height: 100vh !important;
-        height: 100dvh !important;
-        width: auto !important;
-      }
+      width: min(100vw, calc(100dvh * 7 / 3)) !important;
+      height: auto !important;
+      max-width: 100vw !important;
+      max-height: 100dvh !important;
     }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.9.0/lib/p5.min.js"></script>
