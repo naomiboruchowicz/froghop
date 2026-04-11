@@ -88,16 +88,10 @@ let gameState = "start";
 let startButtonHover = false;
 let readyButtonHover = false;
 
-// --- CSS scaling helpers ---
+// p5 handles CSS scaling internally - mouseX/mouseY are already in canvas buffer space
 let canvasEl = null;
-function gameMouseX() {
-  if (!canvasEl) return mouseX;
-  return mouseX * (CANVAS_W / canvasEl.clientWidth);
-}
-function gameMouseY() {
-  if (!canvasEl) return mouseY;
-  return mouseY * (CANVAS_H / canvasEl.clientHeight);
-}
+function gameMouseX() { return mouseX; }
+function gameMouseY() { return mouseY; }
 
 function preload() {
   jungleImg = loadImage("assets/jungle.png");
