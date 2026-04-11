@@ -714,14 +714,31 @@ function getSnakeSpawnY() {
 
 // --- Input ---
 
-function mousePressed() {
-  if (gameState === "start" && startButtonHover) {
+function handleUserTap() {
+  // On start screen, any click/tap enables camera
+  if (gameState === "start") {
     startCamera();
-    return false;
+    return true;
   }
-  if (gameState === "positioning" && readyButtonHover && hasBody()) {
+  // On positioning, any click/tap starts game if body detected
+  if (gameState === "positioning" && hasBody()) {
     gameState = "playing";
     poseHistory = [];
+    return true;
+  }
+  // Game over: restart
+  if (gameOver) {
+    resetGame();
+    return true;
+  }
+  return false;
+}
+
+function mousePressed() {
+  if (handleUserTap()) return false;
+  // In-game click = jump (fallback if camera not working)
+  if (gameState === "playing" && !gamePaused && frog && frog.y === GROUND_Y) {
+    frog.vy = JUMP_IMPULSE;
     return false;
   }
   return true;
@@ -752,19 +769,7 @@ let touchStartY = null;
 const SWIPE_DOWN_THRESHOLD = 30;
 
 function touchStarted() {
-  if (gameState === "start") {
-    startCamera();
-    return false;
-  }
-  if (gameState === "positioning" && hasBody()) {
-    gameState = "playing";
-    poseHistory = [];
-    return false;
-  }
-  if (gameOver) {
-    resetGame();
-    return false;
-  }
+  if (handleUserTap()) return false;
 
   // Record touch start for swipe detection
   if (touches.length > 0) {
