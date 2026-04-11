@@ -1,5 +1,5 @@
 const CANVAS_W = 700;
-const CANVAS_H = 300;
+const CANVAS_H = 400;
 const GROUND_Y = CANVAS_H - CANVAS_H / 5;
 
 const BASE_SPEED = 4;
