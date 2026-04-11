@@ -752,3 +752,52 @@ function keyPressed() {
   }
   return true;
 }
+
+// --- Touch controls for mobile ---
+let touchStartY = null;
+const SWIPE_DOWN_THRESHOLD = 30;
+
+function touchStarted() {
+  if (gameState === "start") {
+    startCamera();
+    return false;
+  }
+  if (gameState === "positioning" && hasBody()) {
+    gameState = "playing";
+    poseHistory = [];
+    return false;
+  }
+  if (gameOver) {
+    resetGame();
+    return false;
+  }
+
+  // Record touch start for swipe detection
+  if (touches.length > 0) {
+    touchStartY = touches[0].y;
+  }
+
+  // Tap to jump (if not swiping)
+  if (gameState === "playing" && !gamePaused && frog.y === GROUND_Y) {
+    frog.vy = JUMP_IMPULSE;
+  }
+  return false;
+}
+
+function touchMoved() {
+  if (gameState !== "playing" || gamePaused) return false;
+  // Detect swipe down for duck
+  if (touches.length > 0 && touchStartY !== null) {
+    const dy = touches[0].y - touchStartY;
+    if (dy > SWIPE_DOWN_THRESHOLD && frog.y === GROUND_Y) {
+      frog.ducking = true;
+    }
+  }
+  return false;
+}
+
+function touchEnded() {
+  frog.ducking = false;
+  touchStartY = null;
+  return false;
+}
