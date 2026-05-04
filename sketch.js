@@ -90,6 +90,8 @@ let readyButtonHover = false;
 let restartButtonHover = false;
 let nameSubmitButtonHover = false;
 let nameFieldHover = false;
+let skipLinkHover = false;
+let postedNameHover = false;
 
 // --- Leaderboard / persistence ---
 const LS_USERNAME_KEY = "froghop_username";
@@ -105,11 +107,21 @@ let nameInputActive = false;
 let submissionState = "idle"; // idle | pending | success | error
 let submissionError = null;
 let submittedScoreValue = null;
-let submittedScoreRank = null;
+let postedAsName = null; // username at time of successful submission (frozen for display)
 let leaderboard = [];
 let leaderboardLoading = false;
 let leaderboardError = false;
 let gameOverHandled = false;
+let gameOverPhase = "results"; // "name_entry" | "results"
+let nameEntryReason = "initial"; // "initial" | "change"
+let userRank = null; // server-reported rank for current username, or null
+
+// Animation
+let gameOverStartedAt = 0;
+const SCORE_COUNTUP_MS = 700;
+const NEW_HIGH_FLASH_MS = 1500;
+let confettiParticles = [];
+let confettiSpawned = false;
 
 // p5 handles CSS scaling internally - mouseX/mouseY are already in canvas buffer space
 let canvasEl = null;
@@ -189,6 +201,13 @@ function ensureNameInputEl() {
     } else if (e.key === "Escape") {
       e.preventDefault();
       blurNameInput();
+      if (gameOverPhase === "name_entry") {
+        if (nameEntryReason === "change") {
+          gameOverPhase = "results";
+        } else {
+          skipNameEntry();
+        }
+      }
     }
   });
   nameInputEl.addEventListener("blur", () => {
@@ -247,6 +266,7 @@ async function submitScore(name, finalScore) {
     }
     submissionState = "success";
     submittedScoreValue = data.score ?? finalScore;
+    postedAsName = name;
     sessionId = null; // session is now spent
     fetchLeaderboard();
   } catch (e) {
@@ -259,10 +279,14 @@ async function fetchLeaderboard() {
   leaderboardLoading = true;
   leaderboardError = false;
   try {
-    const res = await fetch("/api/leaderboard");
+    const url = username
+      ? "/api/leaderboard?username=" + encodeURIComponent(username)
+      : "/api/leaderboard";
+    const res = await fetch(url);
     if (!res.ok) throw new Error("fetch_failed");
     const data = await res.json();
     leaderboard = Array.isArray(data.entries) ? data.entries : [];
+    userRank = typeof data.userRank === "number" ? data.userRank : null;
   } catch (e) {
     leaderboardError = true;
   } finally {
@@ -277,24 +301,66 @@ function submitNameAndScore() {
   persistUsername(clean);
   pendingName = clean;
   blurNameInput();
-  if (sessionId) {
+  gameOverPhase = "results";
+  if (nameEntryReason === "initial" && sessionId) {
     submitScore(clean, Math.floor(score));
-  } else {
-    // Score already posted under previous name; just save new name for next run.
-    submissionState = "success";
   }
+  // For "change" mode (or initial after session is spent), nothing to submit.
+  // username + localStorage are already updated; takes effect next round.
+}
+
+function skipNameEntry() {
+  blurNameInput();
+  gameOverPhase = "results";
+  // Mark as a "skipped" state so results panel shows a "didn't post" hint
+  if (nameEntryReason === "initial") {
+    submissionState = "skipped";
+  }
+}
+
+function openChangeNameUI() {
+  nameEntryReason = "change";
+  gameOverPhase = "name_entry";
+  pendingName = username || "";
+  setTimeout(() => {
+    if (gameOver && gameOverPhase === "name_entry" && !isLikelyTouchDevice()) {
+      focusNameInput();
+    }
+  }, 50);
 }
 
 function handleGameOver() {
   if (gameOverHandled) return;
   gameOverHandled = true;
+  gameOverStartedAt = millis();
   if (highScore > 0) persistHighScore();
+  if (sessionStartFailed) {
+    gameOverPhase = "results";
+    submissionState = "error";
+    submissionError = "no_session";
+    return;
+  }
   if (username) {
     pendingName = username;
+    gameOverPhase = "results";
     submitScore(username, Math.floor(score));
   } else {
-    submissionState = "needs_name";
+    gameOverPhase = "name_entry";
+    nameEntryReason = "initial";
+    pendingName = "";
+    // Auto-focus on desktop. On mobile we wait for explicit tap so the
+    // soft keyboard doesn't pop without user intent.
+    setTimeout(() => {
+      if (gameOver && gameOverPhase === "name_entry" && !isLikelyTouchDevice()) {
+        focusNameInput();
+      }
+    }, 250);
   }
+}
+
+function isLikelyTouchDevice() {
+  return typeof window !== "undefined" &&
+    (("ontouchstart" in window) || (navigator && navigator.maxTouchPoints > 0));
 }
 
 function startCamera() {
@@ -446,7 +512,13 @@ function resetGame() {
   submissionState = "idle";
   submissionError = null;
   submittedScoreValue = null;
-  submittedScoreRank = null;
+  postedAsName = null;
+  gameOverPhase = "results";
+  nameEntryReason = "initial";
+  userRank = null;
+  gameOverStartedAt = 0;
+  confettiParticles = [];
+  confettiSpawned = false;
   if (gameState === "playing") startSession();
 }
 
@@ -855,12 +927,44 @@ const RESTART_BTN_H = 28;
 const RESTART_BTN_X = (CANVAS_W - RESTART_BTN_W) / 2;
 const RESTART_BTN_Y = CANVAS_H - 40;
 
+// --- Name-entry phase layout (centered focus card) ---
+const NEC_TITLE_Y = 85;
+const NEC_SCORE_LINE_Y = 125;
+const NEC_LABEL_Y = 180;
+const NEC_FIELD_W = 280;
+const NEC_FIELD_X = (CANVAS_W - NEC_FIELD_W) / 2;
+const NEC_FIELD_Y = 198;
+const NEC_FIELD_H = 40;
+const NEC_BUTTON_W = 160;
+const NEC_BUTTON_X = (CANVAS_W - NEC_BUTTON_W) / 2;
+const NEC_BUTTON_Y = 262;
+const NEC_BUTTON_H = 36;
+const NEC_SKIP_Y = 322;
+const NEC_SKIP_HIT_W = 120;
+const NEC_SKIP_HIT_H = 22;
+const NEC_SKIP_HIT_X = (CANVAS_W - NEC_SKIP_HIT_W) / 2;
+const NEC_SKIP_HIT_Y = NEC_SKIP_Y - NEC_SKIP_HIT_H / 2;
+
+const POSTED_NAME_HIT_X = GO_LEFT_X;
+const POSTED_NAME_HIT_Y = 215;
+const POSTED_NAME_HIT_W = GO_LEFT_W;
+const POSTED_NAME_HIT_H = 30;
+
 function drawGameOver() {
   // Dim the play field so the panel is legible
   noStroke();
   fill(0, 0, 0, 200);
   rect(0, 0, CANVAS_W, CANVAS_H);
 
+  if (gameOverPhase === "name_entry") {
+    drawNameEntryPhase();
+  } else {
+    drawResultsPhase();
+  }
+  updateAndDrawConfetti();
+}
+
+function drawResultsPhase() {
   // Title
   stroke(12, 20, 18);
   strokeWeight(3);
@@ -875,10 +979,120 @@ function drawGameOver() {
   drawRestartButton();
 }
 
+function drawNameEntryPhase() {
+  const isChange = nameEntryReason === "change";
+  const finalScore = Math.floor(score);
+
+  // Title
+  stroke(12, 20, 18);
+  strokeWeight(3);
+  fill(232, 245, 244);
+  textAlign(CENTER, CENTER);
+  textSize(20);
+  text(isChange ? "CHANGE NAME" : "GAME OVER", CANVAS_W / 2, NEC_TITLE_Y);
+  noStroke();
+
+  // Subtitle / score line
+  fill(232, 245, 244, 160);
+  textSize(8);
+  if (isChange) {
+    text("USED ON YOUR NEXT GAME", CANVAS_W / 2, NEC_SCORE_LINE_Y);
+  } else {
+    text("YOUR SCORE", CANVAS_W / 2, NEC_SCORE_LINE_Y - 14);
+    fill(232, 245, 244);
+    textSize(20);
+    text(String(finalScore), CANVAS_W / 2, NEC_SCORE_LINE_Y + 8);
+  }
+
+  // Label above field
+  fill(232, 245, 244, 180);
+  textSize(9);
+  text(isChange ? "NEW NAME" : "ENTER NAME FOR LEADERBOARD", CANVAS_W / 2, NEC_LABEL_Y);
+
+  drawCenterNameField();
+  drawCenterSubmitButton(isChange ? "SAVE" : "SUBMIT");
+
+  // Skip / cancel link
+  const linkLabel = isChange ? "CANCEL" : "SKIP";
+  fill(232, 245, 244, skipLinkHover ? 220 : 130);
+  textSize(8);
+  textAlign(CENTER, CENTER);
+  text(linkLabel, CANVAS_W / 2, NEC_SKIP_Y);
+  // Underline on hover
+  if (skipLinkHover) {
+    const w = textWidth(linkLabel);
+    stroke(232, 245, 244, 180);
+    strokeWeight(1);
+    line(CANVAS_W / 2 - w / 2, NEC_SKIP_Y + 7, CANVAS_W / 2 + w / 2, NEC_SKIP_Y + 7);
+    noStroke();
+  }
+}
+
+function drawCenterNameField() {
+  const focused = nameInputActive;
+  const display = pendingName || "";
+
+  noStroke();
+  fill(focused ? color(20, 32, 28, 230) : color(20, 32, 28, 180));
+  rect(NEC_FIELD_X, NEC_FIELD_Y, NEC_FIELD_W, NEC_FIELD_H, 4);
+
+  noFill();
+  stroke(focused ? color(120, 240, 160) : color(232, 245, 244, nameFieldHover ? 160 : 90));
+  strokeWeight(focused ? 2 : 1);
+  rect(NEC_FIELD_X, NEC_FIELD_Y, NEC_FIELD_W, NEC_FIELD_H, 4);
+  noStroke();
+
+  textSize(13);
+  if (display.length === 0 && !focused) {
+    fill(232, 245, 244, 80);
+    textAlign(CENTER, CENTER);
+    text("YOUR NAME", NEC_FIELD_X + NEC_FIELD_W / 2, NEC_FIELD_Y + NEC_FIELD_H / 2);
+  } else {
+    fill(232, 245, 244);
+    textAlign(CENTER, CENTER);
+    text(display, NEC_FIELD_X + NEC_FIELD_W / 2, NEC_FIELD_Y + NEC_FIELD_H / 2);
+    if (focused && floor(frameCount / 30) % 2 === 0) {
+      const w = textWidth(display);
+      const cx = NEC_FIELD_X + NEC_FIELD_W / 2 + w / 2 + 3;
+      stroke(232, 245, 244);
+      strokeWeight(1);
+      line(cx, NEC_FIELD_Y + 10, cx, NEC_FIELD_Y + NEC_FIELD_H - 10);
+      noStroke();
+    }
+  }
+}
+
+function drawCenterSubmitButton(label) {
+  const enabled = sanitizeName(pendingName).length > 0;
+  noStroke();
+  if (enabled) {
+    fill(nameSubmitButtonHover ? color(120, 240, 160) : color(100, 220, 140));
+  } else {
+    fill(60, 80, 70);
+  }
+  rect(NEC_BUTTON_X, NEC_BUTTON_Y, NEC_BUTTON_W, NEC_BUTTON_H, 5);
+
+  fill(enabled ? color(12, 20, 18) : color(232, 245, 244, 90));
+  textSize(11);
+  textAlign(CENTER, CENTER);
+  text(label, NEC_BUTTON_X + NEC_BUTTON_W / 2, NEC_BUTTON_Y + NEC_BUTTON_H / 2);
+}
+
+function easeOutCubic(t) {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function getAnimatedScore(finalScore) {
+  if (!gameOverStartedAt) return finalScore;
+  const t = constrain((millis() - gameOverStartedAt) / SCORE_COUNTUP_MS, 0, 1);
+  return Math.floor(finalScore * easeOutCubic(t));
+}
+
 function drawScorePanel() {
   const finalScore = Math.floor(score);
   const finalHigh = Math.floor(highScore);
   const isNewHigh = finalScore > 0 && finalScore >= finalHigh;
+  const animScore = getAnimatedScore(finalScore);
 
   // SCORE label + value
   fill(232, 245, 244, 140);
@@ -887,9 +1101,19 @@ function drawScorePanel() {
   noStroke();
   text("YOUR SCORE", GO_LEFT_X + GO_LEFT_W / 2, GO_SCORE_LABEL_Y);
 
-  fill(isNewHigh ? color(255, 220, 100) : color(232, 245, 244));
+  // New-best flash: pulse from gold to white over flash duration
+  let scoreColor;
+  if (isNewHigh) {
+    const flashT = constrain((millis() - gameOverStartedAt) / NEW_HIGH_FLASH_MS, 0, 1);
+    // Pulse 3 times then settle on gold
+    const pulse = flashT < 1 ? 0.5 + 0.5 * Math.sin(flashT * Math.PI * 6) : 1;
+    scoreColor = lerpColor(color(232, 245, 244), color(255, 220, 100), pulse);
+  } else {
+    scoreColor = color(232, 245, 244);
+  }
+  fill(scoreColor);
   textSize(28);
-  text(String(finalScore), GO_LEFT_X + GO_LEFT_W / 2, GO_SCORE_VALUE_Y);
+  text(String(animScore), GO_LEFT_X + GO_LEFT_W / 2, GO_SCORE_VALUE_Y);
 
   // HIGH score
   fill(232, 245, 244, 140);
@@ -899,44 +1123,114 @@ function drawScorePanel() {
   textSize(11);
   text(String(finalHigh), GO_LEFT_X + GO_LEFT_W / 2, GO_HIGH_VALUE_Y);
 
+  // Spawn confetti once when count-up nears completion AND it's a new best
+  if (isNewHigh && !confettiSpawned && gameOverStartedAt &&
+      millis() - gameOverStartedAt >= SCORE_COUNTUP_MS * 0.6) {
+    spawnConfetti(GO_LEFT_X + GO_LEFT_W / 2, GO_SCORE_VALUE_Y);
+    confettiSpawned = true;
+  }
+
   // Submission flow
   drawSubmissionUI();
+}
+
+function spawnConfetti(x, y) {
+  const colors = [
+    [255, 220, 100],   // gold
+    [100, 220, 140],   // green
+    [120, 200, 255],   // sky
+    [255, 140, 200],   // pink
+    [232, 245, 244],   // white
+  ];
+  for (let i = 0; i < 36; i++) {
+    confettiParticles.push({
+      x: x + random(-8, 8),
+      y: y + random(-4, 4),
+      vx: random(-3.5, 3.5),
+      vy: random(-7, -3),
+      gravity: random(0.18, 0.28),
+      size: random(2.5, 4.5),
+      rot: random(TWO_PI),
+      vrot: random(-0.2, 0.2),
+      color: colors[Math.floor(random(colors.length))],
+      life: 1,
+      decay: random(0.008, 0.016),
+    });
+  }
+}
+
+function updateAndDrawConfetti() {
+  if (confettiParticles.length === 0) return;
+  noStroke();
+  for (let i = confettiParticles.length - 1; i >= 0; i--) {
+    const p = confettiParticles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += p.gravity;
+    p.rot += p.vrot;
+    p.life -= p.decay;
+    if (p.life <= 0 || p.y > CANVAS_H + 20) {
+      confettiParticles.splice(i, 1);
+      continue;
+    }
+    const c = color(p.color[0], p.color[1], p.color[2]);
+    c.setAlpha(Math.max(0, p.life * 255));
+    fill(c);
+    push();
+    translate(p.x, p.y);
+    rotate(p.rot);
+    rect(-p.size / 2, -p.size / 2, p.size, p.size * 0.5);
+    pop();
+  }
 }
 
 function drawSubmissionUI() {
   textAlign(CENTER, CENTER);
   noStroke();
+  const cx = GO_LEFT_X + GO_LEFT_W / 2;
 
   if (sessionStartFailed && submissionState !== "success") {
     fill(255, 160, 80, 200);
     textSize(7);
-    text("OFFLINE: SCORE WON'T POST", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y);
+    text("OFFLINE: SCORE WON'T POST", cx, GO_NAME_LABEL_Y);
     return;
   }
 
-  if (submissionState === "needs_name") {
-    fill(232, 245, 244, 160);
+  if (submissionState === "skipped") {
+    fill(232, 245, 244, 130);
     textSize(7);
-    text("ENTER NAME TO POST", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y);
-    drawNameField();
-    drawSubmitButton();
+    text("DIDN'T POST", cx, GO_NAME_LABEL_Y);
     return;
   }
 
   if (submissionState === "pending") {
     fill(232, 245, 244, 180);
     textSize(8);
-    text("SUBMITTING...", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y + 30);
+    text("POSTING...", cx, GO_NAME_LABEL_Y + 14);
     return;
   }
 
   if (submissionState === "success") {
     fill(100, 220, 140);
     textSize(8);
-    text("POSTED AS", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y);
-    fill(232, 245, 244);
-    textSize(12);
-    text(username || "", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y + 22);
+    text("POSTED AS", cx, GO_NAME_LABEL_Y);
+
+    // Clickable username
+    const display = postedAsName || username || "";
+    fill(postedNameHover ? color(120, 240, 160) : color(232, 245, 244));
+    textSize(13);
+    text(display, cx, GO_NAME_LABEL_Y + 22);
+    if (postedNameHover) {
+      // Underline + edit hint
+      const w = textWidth(display);
+      stroke(120, 240, 160, 180);
+      strokeWeight(1);
+      line(cx - w / 2, GO_NAME_LABEL_Y + 32, cx + w / 2, GO_NAME_LABEL_Y + 32);
+      noStroke();
+    }
+    fill(232, 245, 244, postedNameHover ? 180 : 100);
+    textSize(6);
+    text("TAP TO CHANGE", cx, GO_NAME_LABEL_Y + 44);
     return;
   }
 
@@ -946,10 +1240,10 @@ function drawSubmissionUI() {
     const msg = submissionError === "score_too_high_for_elapsed_time"
       ? "SCORE REJECTED"
       : "SUBMIT FAILED";
-    text(msg, GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y);
+    text(msg, cx, GO_NAME_LABEL_Y);
     fill(232, 245, 244, 140);
     textSize(6);
-    text("CLICK TO RETRY", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y + 14);
+    text("CLICK TO RETRY", cx, GO_NAME_LABEL_Y + 14);
     return;
   }
 }
@@ -1038,10 +1332,13 @@ function drawLeaderboardPanel() {
 
   textSize(9);
   const rows = leaderboard.slice(0, LB_MAX_ROWS);
+  const myNameForCompare = postedAsName || username;
+  let foundMineInTop = false;
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const y = LB_FIRST_ROW_Y + i * LB_ROW_H;
-    const isMine = username && row.username === username;
+    const isMine = myNameForCompare && row.username === myNameForCompare;
+    if (isMine) foundMineInTop = true;
     const alpha = isMine ? 255 : 200;
     fill(isMine ? color(255, 220, 100) : color(232, 245, 244, alpha));
     // Rank
@@ -1052,6 +1349,26 @@ function drawLeaderboardPanel() {
     // Score (right-aligned)
     textAlign(RIGHT, CENTER);
     text(String(row.score), GO_RIGHT_X + GO_RIGHT_W, y);
+  }
+
+  // Show user rank below if not in top 10
+  if (!foundMineInTop && userRank && userRank > LB_MAX_ROWS && submissionState === "success") {
+    const y = LB_FIRST_ROW_Y + Math.min(rows.length, LB_MAX_ROWS) * LB_ROW_H + 10;
+    // Divider
+    stroke(232, 245, 244, 50);
+    strokeWeight(1);
+    line(GO_RIGHT_X, y - 2, GO_RIGHT_X + GO_RIGHT_W, y - 2);
+    noStroke();
+    fill(232, 245, 244, 130);
+    textSize(7);
+    textAlign(LEFT, CENTER);
+    text("YOU", GO_RIGHT_X, y + 10);
+    fill(255, 220, 100);
+    textSize(9);
+    text("#" + userRank + "  " + (postedAsName || username || ""), GO_RIGHT_X + 30, y + 10);
+    fill(255, 220, 100, 220);
+    textAlign(RIGHT, CENTER);
+    text(String(submittedScoreValue ?? Math.floor(score)), GO_RIGHT_X + GO_RIGHT_W, y + 10);
   }
 }
 
@@ -1071,10 +1388,16 @@ function isInRect(mx, my, rx, ry, rw, rh) {
 }
 
 function gameOverHitTest(mx, my) {
-  // Returns one of: "name", "submit", "restart", "retry", null
-  if (submissionState === "needs_name") {
-    if (isInRect(mx, my, NAME_BOX_X, NAME_BOX_Y, NAME_BOX_W, NAME_BOX_H)) return "name";
-    if (isInRect(mx, my, SUBMIT_BTN_X, SUBMIT_BTN_Y, SUBMIT_BTN_W, SUBMIT_BTN_H)) return "submit";
+  if (gameOverPhase === "name_entry") {
+    if (isInRect(mx, my, NEC_FIELD_X, NEC_FIELD_Y, NEC_FIELD_W, NEC_FIELD_H)) return "name";
+    if (isInRect(mx, my, NEC_BUTTON_X, NEC_BUTTON_Y, NEC_BUTTON_W, NEC_BUTTON_H)) return "submit";
+    if (isInRect(mx, my, NEC_SKIP_HIT_X, NEC_SKIP_HIT_Y, NEC_SKIP_HIT_W, NEC_SKIP_HIT_H)) return "skip";
+    return null;
+  }
+  // Results phase
+  if (submissionState === "success" &&
+      isInRect(mx, my, POSTED_NAME_HIT_X, POSTED_NAME_HIT_Y, POSTED_NAME_HIT_W, POSTED_NAME_HIT_H)) {
+    return "edit_name";
   }
   if (submissionState === "error") {
     if (isInRect(mx, my, GO_LEFT_X, GO_NAME_LABEL_Y - 14, GO_LEFT_W, 50)) return "retry";
@@ -1092,7 +1415,25 @@ function handleGameOverClick(mx, my) {
     return true;
   }
   if (hit === "submit") {
+    if (sanitizeName(pendingName).length === 0) {
+      focusNameInput();
+      return true;
+    }
     submitNameAndScore();
+    return true;
+  }
+  if (hit === "skip") {
+    if (nameEntryReason === "change") {
+      // Cancel: just go back to results without saving
+      blurNameInput();
+      gameOverPhase = "results";
+    } else {
+      skipNameEntry();
+    }
+    return true;
+  }
+  if (hit === "edit_name") {
+    openChangeNameUI();
     return true;
   }
   if (hit === "retry") {
@@ -1114,9 +1455,20 @@ function handleGameOverClick(mx, my) {
 function updateGameOverHover() {
   const mx = gameMouseX();
   const my = gameMouseY();
-  restartButtonHover = isInRect(mx, my, RESTART_BTN_X, RESTART_BTN_Y - RESTART_BTN_H / 2, RESTART_BTN_W, RESTART_BTN_H);
-  nameFieldHover = submissionState === "needs_name" && isInRect(mx, my, NAME_BOX_X, NAME_BOX_Y, NAME_BOX_W, NAME_BOX_H);
-  nameSubmitButtonHover = submissionState === "needs_name" && isInRect(mx, my, SUBMIT_BTN_X, SUBMIT_BTN_Y, SUBMIT_BTN_W, SUBMIT_BTN_H);
+  if (gameOverPhase === "name_entry") {
+    nameFieldHover = isInRect(mx, my, NEC_FIELD_X, NEC_FIELD_Y, NEC_FIELD_W, NEC_FIELD_H);
+    nameSubmitButtonHover = isInRect(mx, my, NEC_BUTTON_X, NEC_BUTTON_Y, NEC_BUTTON_W, NEC_BUTTON_H);
+    skipLinkHover = isInRect(mx, my, NEC_SKIP_HIT_X, NEC_SKIP_HIT_Y, NEC_SKIP_HIT_W, NEC_SKIP_HIT_H);
+    restartButtonHover = false;
+    postedNameHover = false;
+  } else {
+    restartButtonHover = isInRect(mx, my, RESTART_BTN_X, RESTART_BTN_Y - RESTART_BTN_H / 2, RESTART_BTN_W, RESTART_BTN_H);
+    postedNameHover = submissionState === "success" &&
+      isInRect(mx, my, POSTED_NAME_HIT_X, POSTED_NAME_HIT_Y, POSTED_NAME_HIT_W, POSTED_NAME_HIT_H);
+    nameFieldHover = false;
+    nameSubmitButtonHover = false;
+    skipLinkHover = false;
+  }
 }
 
 function drawPaused() {
