@@ -87,6 +87,29 @@ let duckPendingTimer = null;
 let gameState = "start";
 let startButtonHover = false;
 let readyButtonHover = false;
+let restartButtonHover = false;
+let nameSubmitButtonHover = false;
+let nameFieldHover = false;
+
+// --- Leaderboard / persistence ---
+const LS_USERNAME_KEY = "froghop_username";
+const LS_HIGH_SCORE_KEY = "froghop_high_score";
+const NAME_MAX_LEN = 12;
+
+let sessionId = null;
+let sessionStartFailed = false;
+let username = null;
+let pendingName = "";
+let nameInputEl = null;
+let nameInputActive = false;
+let submissionState = "idle"; // idle | pending | success | error
+let submissionError = null;
+let submittedScoreValue = null;
+let submittedScoreRank = null;
+let leaderboard = [];
+let leaderboardLoading = false;
+let leaderboardError = false;
+let gameOverHandled = false;
 
 // p5 handles CSS scaling internally - mouseX/mouseY are already in canvas buffer space
 let canvasEl = null;
@@ -111,7 +134,167 @@ function setup() {
   if (container) canvas.parent("#game-container");
   canvasEl = document.querySelector("#game-container canvas");
   if (pixelFont) textFont(pixelFont);
+  hydrateFromLocalStorage();
+  ensureNameInputEl();
+  fetchLeaderboard();
   resetGame();
+}
+
+function hydrateFromLocalStorage() {
+  try {
+    const storedName = localStorage.getItem(LS_USERNAME_KEY);
+    if (storedName) username = sanitizeName(storedName);
+    const storedHigh = parseInt(localStorage.getItem(LS_HIGH_SCORE_KEY) || "0", 10);
+    if (Number.isFinite(storedHigh) && storedHigh > 0) highScore = storedHigh;
+  } catch (e) {
+    // localStorage unavailable (private mode etc) - silently continue
+  }
+}
+
+function persistHighScore() {
+  try {
+    localStorage.setItem(LS_HIGH_SCORE_KEY, String(Math.floor(highScore)));
+  } catch (e) {}
+}
+
+function persistUsername(name) {
+  try {
+    localStorage.setItem(LS_USERNAME_KEY, name);
+  } catch (e) {}
+}
+
+function sanitizeName(raw) {
+  if (typeof raw !== "string") return "";
+  return raw.replace(/[\x00-\x1f]/g, "").trim().slice(0, NAME_MAX_LEN);
+}
+
+// Hidden DOM input captures keystrokes (also triggers mobile keyboard on tap)
+function ensureNameInputEl() {
+  if (nameInputEl) return;
+  nameInputEl = document.createElement("input");
+  nameInputEl.type = "text";
+  nameInputEl.maxLength = NAME_MAX_LEN;
+  nameInputEl.autocomplete = "off";
+  nameInputEl.autocapitalize = "characters";
+  nameInputEl.spellcheck = false;
+  nameInputEl.setAttribute("aria-label", "Your name");
+  nameInputEl.style.cssText = "position:fixed;left:50%;top:0;width:1px;height:1px;opacity:0;pointer-events:none;border:0;padding:0;font-size:16px;";
+  nameInputEl.addEventListener("input", () => {
+    pendingName = sanitizeName(nameInputEl.value);
+  });
+  nameInputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitNameAndScore();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      blurNameInput();
+    }
+  });
+  nameInputEl.addEventListener("blur", () => {
+    nameInputActive = false;
+  });
+  document.body.appendChild(nameInputEl);
+}
+
+function focusNameInput() {
+  if (!nameInputEl) return;
+  nameInputActive = true;
+  nameInputEl.value = pendingName;
+  nameInputEl.focus();
+}
+
+function blurNameInput() {
+  if (!nameInputEl) return;
+  nameInputActive = false;
+  nameInputEl.blur();
+}
+
+// --- Network ---
+
+async function startSession() {
+  sessionId = null;
+  sessionStartFailed = false;
+  try {
+    const res = await fetch("/api/start", { method: "POST" });
+    if (!res.ok) throw new Error("start_failed");
+    const data = await res.json();
+    sessionId = data.sessionId;
+  } catch (e) {
+    sessionStartFailed = true;
+  }
+}
+
+async function submitScore(name, finalScore) {
+  if (!sessionId) {
+    submissionState = "error";
+    submissionError = "no_session";
+    return;
+  }
+  submissionState = "pending";
+  submissionError = null;
+  try {
+    const res = await fetch("/api/score", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId, score: finalScore, username: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      submissionState = "error";
+      submissionError = data.error || "submit_failed";
+      return;
+    }
+    submissionState = "success";
+    submittedScoreValue = data.score ?? finalScore;
+    sessionId = null; // session is now spent
+    fetchLeaderboard();
+  } catch (e) {
+    submissionState = "error";
+    submissionError = "network_error";
+  }
+}
+
+async function fetchLeaderboard() {
+  leaderboardLoading = true;
+  leaderboardError = false;
+  try {
+    const res = await fetch("/api/leaderboard");
+    if (!res.ok) throw new Error("fetch_failed");
+    const data = await res.json();
+    leaderboard = Array.isArray(data.entries) ? data.entries : [];
+  } catch (e) {
+    leaderboardError = true;
+  } finally {
+    leaderboardLoading = false;
+  }
+}
+
+function submitNameAndScore() {
+  const clean = sanitizeName(pendingName);
+  if (clean.length === 0) return;
+  username = clean;
+  persistUsername(clean);
+  pendingName = clean;
+  blurNameInput();
+  if (sessionId) {
+    submitScore(clean, Math.floor(score));
+  } else {
+    // Score already posted under previous name; just save new name for next run.
+    submissionState = "success";
+  }
+}
+
+function handleGameOver() {
+  if (gameOverHandled) return;
+  gameOverHandled = true;
+  if (highScore > 0) persistHighScore();
+  if (username) {
+    pendingName = username;
+    submitScore(username, Math.floor(score));
+  } else {
+    submissionState = "needs_name";
+  }
 }
 
 function startCamera() {
@@ -259,6 +442,12 @@ function resetGame() {
   spawnTimer = 2500;
   bgOffset = 0;
   groundOffset = 0;
+  gameOverHandled = false;
+  submissionState = "idle";
+  submissionError = null;
+  submittedScoreValue = null;
+  submittedScoreRank = null;
+  if (gameState === "playing") startSession();
 }
 
 // =====================
@@ -290,6 +479,9 @@ function draw() {
     updateScore();
     checkCollisions();
   }
+
+  if (gameOver && !gameOverHandled) handleGameOver();
+  if (gameOver) updateGameOverHover();
 
   drawFrog();
   drawObstacles();
@@ -436,6 +628,7 @@ function drawPositioningScreen() {
 // --- Camera PIP during gameplay ---
 function drawCamPip() {
   if (!video) return;
+  if (gameOver) return; // game-over overlay uses this corner for the leaderboard
 
   const x = CANVAS_W - CAM_W - CAM_MARGIN;
   const y = CAM_MARGIN;
@@ -633,16 +826,297 @@ function drawHud() {
   noStroke();
 }
 
+// --- Game over layout constants ---
+const GO_PAD_X = 40;
+const GO_LEFT_X = GO_PAD_X;
+const GO_LEFT_W = 280;
+const GO_RIGHT_X = 360;
+const GO_RIGHT_W = CANVAS_W - GO_RIGHT_X - GO_PAD_X;
+const GO_TITLE_Y = 38;
+const GO_SCORE_LABEL_Y = 78;
+const GO_SCORE_VALUE_Y = 108;
+const GO_HIGH_LABEL_Y = 145;
+const GO_HIGH_VALUE_Y = 165;
+const GO_NAME_LABEL_Y = 200;
+const NAME_BOX_X = GO_LEFT_X + 10;
+const NAME_BOX_Y = 215;
+const NAME_BOX_W = GO_LEFT_W - 20;
+const NAME_BOX_H = 32;
+const SUBMIT_BTN_W = 120;
+const SUBMIT_BTN_H = 30;
+const SUBMIT_BTN_X = GO_LEFT_X + (GO_LEFT_W - SUBMIT_BTN_W) / 2;
+const SUBMIT_BTN_Y = 257;
+const LB_TITLE_Y = 78;
+const LB_FIRST_ROW_Y = 102;
+const LB_ROW_H = 18;
+const LB_MAX_ROWS = 10;
+const RESTART_BTN_W = 220;
+const RESTART_BTN_H = 28;
+const RESTART_BTN_X = (CANVAS_W - RESTART_BTN_W) / 2;
+const RESTART_BTN_Y = CANVAS_H - 40;
+
 function drawGameOver() {
+  // Dim the play field so the panel is legible
+  noStroke();
+  fill(0, 0, 0, 200);
+  rect(0, 0, CANVAS_W, CANVAS_H);
+
+  // Title
   stroke(12, 20, 18);
   strokeWeight(3);
   fill(232, 245, 244);
   textAlign(CENTER, CENTER);
-  textSize(22);
-  text("GAME OVER", CANVAS_W / 2, CANVAS_H / 2 - 8);
-  textSize(14);
-  text("Press Space to Restart", CANVAS_W / 2, CANVAS_H / 2 + 16);
+  textSize(20);
+  text("GAME OVER", CANVAS_W / 2, GO_TITLE_Y);
   noStroke();
+
+  drawScorePanel();
+  drawLeaderboardPanel();
+  drawRestartButton();
+}
+
+function drawScorePanel() {
+  const finalScore = Math.floor(score);
+  const finalHigh = Math.floor(highScore);
+  const isNewHigh = finalScore > 0 && finalScore >= finalHigh;
+
+  // SCORE label + value
+  fill(232, 245, 244, 140);
+  textAlign(CENTER, CENTER);
+  textSize(8);
+  noStroke();
+  text("YOUR SCORE", GO_LEFT_X + GO_LEFT_W / 2, GO_SCORE_LABEL_Y);
+
+  fill(isNewHigh ? color(255, 220, 100) : color(232, 245, 244));
+  textSize(28);
+  text(String(finalScore), GO_LEFT_X + GO_LEFT_W / 2, GO_SCORE_VALUE_Y);
+
+  // HIGH score
+  fill(232, 245, 244, 140);
+  textSize(7);
+  text(isNewHigh ? "NEW BEST!" : "BEST", GO_LEFT_X + GO_LEFT_W / 2, GO_HIGH_LABEL_Y);
+  fill(232, 245, 244, isNewHigh ? 255 : 200);
+  textSize(11);
+  text(String(finalHigh), GO_LEFT_X + GO_LEFT_W / 2, GO_HIGH_VALUE_Y);
+
+  // Submission flow
+  drawSubmissionUI();
+}
+
+function drawSubmissionUI() {
+  textAlign(CENTER, CENTER);
+  noStroke();
+
+  if (sessionStartFailed && submissionState !== "success") {
+    fill(255, 160, 80, 200);
+    textSize(7);
+    text("OFFLINE: SCORE WON'T POST", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y);
+    return;
+  }
+
+  if (submissionState === "needs_name") {
+    fill(232, 245, 244, 160);
+    textSize(7);
+    text("ENTER NAME TO POST", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y);
+    drawNameField();
+    drawSubmitButton();
+    return;
+  }
+
+  if (submissionState === "pending") {
+    fill(232, 245, 244, 180);
+    textSize(8);
+    text("SUBMITTING...", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y + 30);
+    return;
+  }
+
+  if (submissionState === "success") {
+    fill(100, 220, 140);
+    textSize(8);
+    text("POSTED AS", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y);
+    fill(232, 245, 244);
+    textSize(12);
+    text(username || "", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y + 22);
+    return;
+  }
+
+  if (submissionState === "error") {
+    fill(255, 120, 120);
+    textSize(7);
+    const msg = submissionError === "score_too_high_for_elapsed_time"
+      ? "SCORE REJECTED"
+      : "SUBMIT FAILED";
+    text(msg, GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y);
+    fill(232, 245, 244, 140);
+    textSize(6);
+    text("CLICK TO RETRY", GO_LEFT_X + GO_LEFT_W / 2, GO_NAME_LABEL_Y + 14);
+    return;
+  }
+}
+
+function drawNameField() {
+  const focused = nameInputActive;
+  const display = pendingName || "";
+
+  // Field background
+  noStroke();
+  fill(focused ? color(20, 32, 28, 230) : color(20, 32, 28, 180));
+  rect(NAME_BOX_X, NAME_BOX_Y, NAME_BOX_W, NAME_BOX_H, 4);
+
+  // Field border
+  noFill();
+  stroke(focused ? color(120, 240, 160) : color(232, 245, 244, nameFieldHover ? 140 : 80));
+  strokeWeight(focused ? 2 : 1);
+  rect(NAME_BOX_X, NAME_BOX_Y, NAME_BOX_W, NAME_BOX_H, 4);
+  noStroke();
+
+  // Text
+  textAlign(LEFT, CENTER);
+  textSize(11);
+  if (display.length === 0 && !focused) {
+    fill(232, 245, 244, 80);
+    text("YOUR NAME", NAME_BOX_X + 10, NAME_BOX_Y + NAME_BOX_H / 2);
+  } else {
+    fill(232, 245, 244);
+    text(display, NAME_BOX_X + 10, NAME_BOX_Y + NAME_BOX_H / 2);
+    // Blinking cursor when focused
+    if (focused && floor(frameCount / 30) % 2 === 0) {
+      const w = textWidth(display);
+      const cx = NAME_BOX_X + 10 + w + 2;
+      stroke(232, 245, 244);
+      strokeWeight(1);
+      line(cx, NAME_BOX_Y + 8, cx, NAME_BOX_Y + NAME_BOX_H - 8);
+      noStroke();
+    }
+  }
+}
+
+function drawSubmitButton() {
+  const enabled = sanitizeName(pendingName).length > 0;
+  noStroke();
+  if (enabled) {
+    fill(nameSubmitButtonHover ? color(120, 240, 160) : color(100, 220, 140));
+  } else {
+    fill(60, 80, 70);
+  }
+  rect(SUBMIT_BTN_X, SUBMIT_BTN_Y, SUBMIT_BTN_W, SUBMIT_BTN_H, 4);
+
+  fill(enabled ? color(12, 20, 18) : color(232, 245, 244, 80));
+  textSize(10);
+  textAlign(CENTER, CENTER);
+  text("SUBMIT", SUBMIT_BTN_X + SUBMIT_BTN_W / 2, SUBMIT_BTN_Y + SUBMIT_BTN_H / 2);
+}
+
+function drawLeaderboardPanel() {
+  textAlign(LEFT, CENTER);
+  noStroke();
+
+  fill(232, 245, 244, 140);
+  textSize(8);
+  text("TOP 10", GO_RIGHT_X, LB_TITLE_Y);
+
+  if (leaderboardLoading && leaderboard.length === 0) {
+    fill(232, 245, 244, 100);
+    textSize(7);
+    text("LOADING...", GO_RIGHT_X, LB_FIRST_ROW_Y);
+    return;
+  }
+
+  if (leaderboardError && leaderboard.length === 0) {
+    fill(255, 160, 80, 180);
+    textSize(7);
+    text("UNAVAILABLE", GO_RIGHT_X, LB_FIRST_ROW_Y);
+    return;
+  }
+
+  if (leaderboard.length === 0) {
+    fill(232, 245, 244, 100);
+    textSize(7);
+    text("BE THE FIRST", GO_RIGHT_X, LB_FIRST_ROW_Y);
+    return;
+  }
+
+  textSize(9);
+  const rows = leaderboard.slice(0, LB_MAX_ROWS);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const y = LB_FIRST_ROW_Y + i * LB_ROW_H;
+    const isMine = username && row.username === username;
+    const alpha = isMine ? 255 : 200;
+    fill(isMine ? color(255, 220, 100) : color(232, 245, 244, alpha));
+    // Rank
+    textAlign(LEFT, CENTER);
+    text(String(i + 1).padStart(2, " ") + ".", GO_RIGHT_X, y);
+    // Name
+    text(row.username, GO_RIGHT_X + 30, y);
+    // Score (right-aligned)
+    textAlign(RIGHT, CENTER);
+    text(String(row.score), GO_RIGHT_X + GO_RIGHT_W, y);
+  }
+}
+
+function drawRestartButton() {
+  noStroke();
+  fill(restartButtonHover ? color(255, 255, 255, 25) : color(255, 255, 255, 12));
+  rect(RESTART_BTN_X, RESTART_BTN_Y - RESTART_BTN_H / 2, RESTART_BTN_W, RESTART_BTN_H, 4);
+
+  fill(232, 245, 244, restartButtonHover ? 255 : 180);
+  textSize(8);
+  textAlign(CENTER, CENTER);
+  text("PRESS SPACE OR TAP TO RESTART", CANVAS_W / 2, RESTART_BTN_Y);
+}
+
+function isInRect(mx, my, rx, ry, rw, rh) {
+  return mx >= rx && mx <= rx + rw && my >= ry && my <= ry + rh;
+}
+
+function gameOverHitTest(mx, my) {
+  // Returns one of: "name", "submit", "restart", "retry", null
+  if (submissionState === "needs_name") {
+    if (isInRect(mx, my, NAME_BOX_X, NAME_BOX_Y, NAME_BOX_W, NAME_BOX_H)) return "name";
+    if (isInRect(mx, my, SUBMIT_BTN_X, SUBMIT_BTN_Y, SUBMIT_BTN_W, SUBMIT_BTN_H)) return "submit";
+  }
+  if (submissionState === "error") {
+    if (isInRect(mx, my, GO_LEFT_X, GO_NAME_LABEL_Y - 14, GO_LEFT_W, 50)) return "retry";
+  }
+  if (isInRect(mx, my, RESTART_BTN_X, RESTART_BTN_Y - RESTART_BTN_H / 2, RESTART_BTN_W, RESTART_BTN_H)) {
+    return "restart";
+  }
+  return null;
+}
+
+function handleGameOverClick(mx, my) {
+  const hit = gameOverHitTest(mx, my);
+  if (hit === "name") {
+    focusNameInput();
+    return true;
+  }
+  if (hit === "submit") {
+    submitNameAndScore();
+    return true;
+  }
+  if (hit === "retry") {
+    if (username) submitScore(username, Math.floor(score));
+    return true;
+  }
+  if (hit === "restart") {
+    blurNameInput();
+    resetGame();
+    return true;
+  }
+  // Tap outside name field while focused = blur
+  if (nameInputActive) {
+    blurNameInput();
+  }
+  return false;
+}
+
+function updateGameOverHover() {
+  const mx = gameMouseX();
+  const my = gameMouseY();
+  restartButtonHover = isInRect(mx, my, RESTART_BTN_X, RESTART_BTN_Y - RESTART_BTN_H / 2, RESTART_BTN_W, RESTART_BTN_H);
+  nameFieldHover = submissionState === "needs_name" && isInRect(mx, my, NAME_BOX_X, NAME_BOX_Y, NAME_BOX_W, NAME_BOX_H);
+  nameSubmitButtonHover = submissionState === "needs_name" && isInRect(mx, my, SUBMIT_BTN_X, SUBMIT_BTN_Y, SUBMIT_BTN_W, SUBMIT_BTN_H);
 }
 
 function drawPaused() {
@@ -724,18 +1198,19 @@ function handleUserTap() {
   if (gameState === "positioning" && hasBody()) {
     gameState = "playing";
     poseHistory = [];
+    startSession();
     return true;
   }
-  // Game over: restart
-  if (gameOver) {
-    resetGame();
-    return true;
-  }
+  // Game over: gameOver UI handles its own clicks (name input, submit, restart)
   return false;
 }
 
 function mousePressed() {
   if (handleUserTap()) return false;
+  if (gameOver) {
+    handleGameOverClick(gameMouseX(), gameMouseY());
+    return false;
+  }
   // In-game click = jump (fallback if camera not working)
   if (gameState === "playing" && !gamePaused && frog && frog.y === GROUND_Y) {
     frog.vy = JUMP_IMPULSE;
@@ -745,6 +1220,9 @@ function mousePressed() {
 }
 
 function keyPressed() {
+  // Don't intercept any keys while typing in the name input
+  if (nameInputActive) return true;
+
   const isJumpKey = key === " " || keyCode === UP_ARROW;
 
   if (key === "p" || key === "P") {
@@ -770,6 +1248,11 @@ const SWIPE_DOWN_THRESHOLD = 30;
 
 function touchStarted() {
   if (handleUserTap()) return false;
+
+  if (gameOver) {
+    handleGameOverClick(gameMouseX(), gameMouseY());
+    return false;
+  }
 
   // Record touch start for swipe detection
   if (touches.length > 0) {
